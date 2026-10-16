@@ -1,7 +1,7 @@
 ﻿<#
   Interface à deux onglets :
-    1. Prétraitement (AsciiArtPreProcess.ps1)  : lissage, posterisation, fond blanc
-    2. ASCII         (AsciiArtConverter.ps1)    : conversion de l'image prétraitée
+    1. Prétraitement : étapes réordonnables de taille, seuil blanc, aplats, bords, gomme et masque
+    2. ASCII : conversion de l'image et du masque issus du prétraitement
   Chaque changement de paramètre recalcule automatiquement la vue.
   Usage : .\AsciiArtGUI.ps1 [-Path image.png]
   Test  : .\AsciiArtGUI.ps1 -Path img.png -Screenshot out.png [-Tab 0|1]
@@ -9,7 +9,7 @@
 param(
     [string]$Path,
     [string]$Screenshot,
-    [int]$Tab = 1
+    [ValidateRange(0, 1)][int]$Tab = 1
 )
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -17,20 +17,28 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
 # ---------- Chargement des moteurs C# ----------
 function Import-Engine([string]$file, [string]$class) {
-    $text = Get-Content (Join-Path $PSScriptRoot $file) -Raw -Encoding UTF8
-    $m = [regex]::Match($text, "(?s)\`$code = @'\r?\n(.*?)\r?\n'@")
-    if (-not $m.Success) { throw "Moteur introuvable dans $file" }
-    $code = $m.Groups[1].Value
-    $md5  = [Security.Cryptography.MD5]::Create()
-    $hash = -join ($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($code))[0..5] | ForEach-Object { $_.ToString('x2') })
-    $tn = "${class}_$hash"
-    if (-not ($tn -as [type])) {
-        Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition $code.Replace($class, $tn)
-    }
-    return $tn
+    . (Join-Path $PSScriptRoot 'AsciiArtPluginCompilator.ps1')
+    return Import-AsciiEngine -File $file -Class $class
 }
-$preType = Import-Engine 'AsciiArtPreProcess.ps1' 'PreProcessor'
+$script:preCache = New-Object (Import-Engine 'AsciiArtPreProcess.ps1' 'PreProcessCache')
+$script:sourceGeneration = [long]0
 $ascType = Import-Engine 'AsciiArtConverter.ps1' 'AsciiEdge'
+# Les pinceaux éditent chacun un canal d'étape dédié ; le raster garde les couches et aperçus.
+$brushType = Import-Engine 'AsciiArtBrush.ps1' 'AsciiBrush'
+$rasterMaskType = Import-Engine 'AsciiArtRaster.ps1' 'AsciiRasterMask'
+$script:maskEditor = $null
+$script:preResult = $null
+$script:previewBmp = $null
+
+# Interfaces des outils (moteurs/CLI inchangés). Commenter UNE ligne retire l'outil,
+# ses boutons, ses paramètres et ses actions, y compris ses canaux PNG importés.
+. (Join-Path $PSScriptRoot 'AsciiArtPluginToolsGUI.ps1')
+. (Join-Path $PSScriptRoot 'plugin\Taille\AsciiArtToolSize.ps1')
+. (Join-Path $PSScriptRoot 'plugin\SeuilBlanc\AsciiArtToolWhite.ps1')
+. (Join-Path $PSScriptRoot 'plugin\Aplats\AsciiArtToolPosterize.ps1')
+. (Join-Path $PSScriptRoot 'plugin\Bords\AsciiArtToolEdges.ps1')
+. (Join-Path $PSScriptRoot 'plugin\Gomme\AsciiArtToolEraser.ps1')
+. (Join-Path $PSScriptRoot 'plugin\Masque\AsciiArtToolExclusion.ps1')
 
 # ---------- Palettes ----------
 $palettes = [ordered]@{
@@ -46,7 +54,7 @@ $palettes = [ordered]@{
 
 # ---------- Workers (calcul en arrière-plan avec anti-rebond) ----------
 function New-Worker([scriptblock]$work, [scriptblock]$getArgs, [scriptblock]$onDone) {
-    $w = @{ Work = $work; GetArgs = $getArgs; OnDone = $onDone; Job = $null; Dirty = $false; Status = $null }
+    $w = @{ Work = $work; GetArgs = $getArgs; OnDone = $onDone; Job = $null; Dirty = $false; Status = $null; Revision = 0 }
     $t = New-Object Windows.Forms.Timer
     $t.Interval = 350
     $t.Tag = $w
@@ -54,15 +62,22 @@ function New-Worker([scriptblock]$work, [scriptblock]$getArgs, [scriptblock]$onD
     $w.Timer = $t
     return $w
 }
-function Request-Work($w) { $w.Timer.Stop(); $w.Timer.Start() }
+function Request-Work($w) {
+    $w.Revision++; $w.Timer.Stop(); $w.Timer.Start()
+    if ($w -eq $script:pre -and $script:asc) {
+        $script:asc.Revision++
+        $script:lines = @()
+        if ($txt) { $txt.Clear() }
+    }
+}
 function Invoke-Work($w) {
-    if ($w.Job) { $w.Dirty = $true; return }
+    if ($w.Job) { $w.Revision++; $w.Dirty = $true; return }
     $jobArgs = & $w.GetArgs
     if ($null -eq $jobArgs) { return }
     $ps = [powershell]::Create()
     [void]$ps.AddScript($w.Work)
     foreach ($a in $jobArgs) { [void]$ps.AddArgument($a) }
-    $w.Job = @{ Ps = $ps; Handle = $ps.BeginInvoke(); Watch = [Diagnostics.Stopwatch]::StartNew() }
+    $w.Job = @{ Ps = $ps; Handle = $ps.BeginInvoke(); Watch = [Diagnostics.Stopwatch]::StartNew(); Revision = $w.Revision }
     if ($w.Status) { $w.Status.Text = 'Calcul en cours...' }
 }
 function Complete-Work($w) {
@@ -72,7 +87,11 @@ function Complete-Work($w) {
     try {
         $res = $j.Ps.EndInvoke($j.Handle)
         if ($j.Ps.Streams.Error.Count -gt 0) { throw $j.Ps.Streams.Error[0].ToString() }
-        & $w.OnDone $res $j.Watch.Elapsed.TotalSeconds
+        if ($j.Revision -eq $w.Revision) {
+            & $w.OnDone $res $j.Watch.Elapsed.TotalSeconds
+        } else {
+            foreach ($item in $res) { if ($item -is [IDisposable]) { $item.Dispose() } }
+        }
     } catch {
         if ($w.Status) { $w.Status.Text = "Erreur : $($_.Exception.Message)" }
     }
@@ -81,13 +100,14 @@ function Complete-Work($w) {
 }
 
 $preWork = {
-    param($tn, $path, $maxSize, $white, $steps)
-    ($tn -as [type])::Run($path, $maxSize, $white, $steps)
+    param($cache, $path, $sourceKey, $steps, $masks)
+    try { $cache.Run($path, $sourceKey, $steps, [Drawing.Bitmap[]]$masks) }
+    finally { foreach ($mask in $masks) { $mask.Dispose() } }
 }
 $ascWork = {
-    param($tn, $bmp, $w, $h, $detail, $smooth, $minSize, $invert, $fill, $chars, $straight)
-    try { ($tn -as [type])::Run($bmp, $w, $h, $detail, $smooth, $minSize, $invert, $fill, $chars, $straight) }
-    finally { $bmp.Dispose() }
+    param($tn, $bmp, $w, $h, $detail, $smooth, $minSize, $invert, $fill, $chars, $straight, $mask)
+    try { ($tn -as [type])::Run($bmp, $w, $h, $detail, $smooth, $minSize, $invert, $fill, $chars, $straight, $mask) }
+    finally { $bmp.Dispose(); $mask.Dispose() }
 }
 
 $script:file   = $null
@@ -98,7 +118,7 @@ $script:shotDone = $false
 
 # ---------- Fenêtre ----------
 $form = New-Object Windows.Forms.Form
-$form.Text = 'ASCII Art - Prétraitement et conversion'
+$form.Text = 'ASCII Art - Prétraitement, masques et conversion'
 $form.Size = New-Object Drawing.Size(1350, 900)
 $form.StartPosition = 'CenterScreen'
 $form.AllowDrop = $true
@@ -179,31 +199,33 @@ function Add-Check($parent, [string]$text, [bool]$val, $worker) {
 # ---------- Onglet 1 : Prétraitement ----------
 $script:pre = New-Worker $preWork {
     if (-not $script:file) { return $null }
-    @($preType, $script:file, [int]$numMax.Value, [int]$numWhite.Value, (Get-Steps))
+    $masks = New-Object 'Collections.Generic.List[Drawing.Bitmap]'
+    foreach ($step in $script:steps) {
+        if ($step.Editor) { $masks.Add($step.Editor.Rasterize($script:orig.Width, $script:orig.Height)) }
+    }
+    $script:runningSteps = $script:steps.ToArray()
+    @($script:preCache, $script:file, [string]$script:sourceGeneration, (Get-Steps), $masks.ToArray())
 } {
     param($res, $secs)
-    if ($script:preBmp) { $script:preBmp.Dispose() }
-    $script:preBmp = [Drawing.Bitmap]$res[0]
+    if ($script:preResult) { $script:preResult.Dispose() }
+    $script:preResult = $res[0]
+    $script:resultSteps = $script:runningSteps
+    $script:preBmp = $script:preResult.Image
     Update-Picture
-    $script:pre.Status.Text = ('Prétraitement : {0}x{1} en {2:N2} s' -f $script:preBmp.Width, $script:preBmp.Height, $secs)
+    $script:pre.Status.Text = ('Prétraitement : {0}x{1} en {2:N2} s ({3} réutilisées, {4} calculées)' -f $script:preBmp.Width, $script:preBmp.Height, $secs, $script:preCache.ReusedSteps, $script:preCache.ProcessedSteps)
     Invoke-Work $script:asc
 }
 
 $pnlPre = New-SidePanel $tabPre
-$numMax   = Add-Number $pnlPre 'Taille max (px, plus grand côté)' 100 4000 800 $script:pre
-$numWhite = Add-Number $pnlPre 'Seuil du fond blanc (200-255)' 200 255 250 $script:pre
-Set-Tip $numMax "Taille de travail : le plus grand côté de l'image est ramené à cette valeur (jamais agrandie).`nPlus petit = plus rapide et plus de lissage naturel ; plus grand = contours plus fins mais plus de détails parasites."
-Set-Tip $numWhite "Un pixel dont R, V et B sont tous >= ce seuil est considéré comme fond : remis en blanc pur et jamais lissé ni mélangé au sujet.`nBaisser le seuil supprime les ombres et reflets très clairs, mais peut avaler un sujet clair. 255 = seul le blanc pur est du fond."
 
-# Liste d'étapes d'aplats appliquées dans l'ordre (en nombre quelconque)
+# Liste d'étapes appliquées dans l'ordre (en nombre quelconque)
 [void](Add-Label $pnlPre 'Étapes (appliquées de haut en bas) :')
 $lstSteps = New-Object Windows.Forms.ListBox
 $lstSteps.SetBounds(10, $script:y, 265, 110); $lstSteps.IntegralHeight = $false
 $pnlPre.Controls.Add($lstSteps); $script:y += 116
-$btnAddL = New-Object Windows.Forms.Button; $btnAddL.Text = '+ Aplats'; $btnAddL.SetBounds(10, $script:y, 85, 26)
-$btnAddE = New-Object Windows.Forms.Button; $btnAddE.Text = '+ Bords'; $btnAddE.SetBounds(100, $script:y, 85, 26)
-$btnDel  = New-Object Windows.Forms.Button; $btnDel.Text  = 'Supprimer'; $btnDel.SetBounds(190, $script:y, 85, 26)
-$pnlPre.Controls.AddRange(@($btnAddL, $btnAddE, $btnDel)); $script:y += 30
+Add-AsciiStepButtons $pnlPre
+$btnDel = New-Object Windows.Forms.Button; $btnDel.Text = 'Supprimer cette étape'; $btnDel.SetBounds(10, $script:y, 265, 26)
+$pnlPre.Controls.Add($btnDel); $script:y += 30
 $btnUp   = New-Object Windows.Forms.Button; $btnUp.Text = [string][char]0x25B2 + ' Monter';  $btnUp.SetBounds(10, $script:y, 130, 26)
 $btnDown = New-Object Windows.Forms.Button; $btnDown.Text = [string][char]0x25BC + ' Descendre'; $btnDown.SetBounds(145, $script:y, 130, 26)
 $pnlPre.Controls.AddRange(@($btnUp, $btnDown)); $script:y += 34
@@ -212,25 +234,25 @@ $tbStep = New-Object Windows.Forms.TrackBar
 $tbStep.SetBounds(5, $script:y, 275, 40); $tbStep.Enabled = $false
 $pnlPre.Controls.Add($tbStep); $script:y += 46
 
-Set-Tip $lstSteps "Chaque ligne est une étape d'aplats ; l'ordre compte (6 niveaux puis 3 n'est pas pareil que 3 puis 6) et on peut en empiler plusieurs.`nListe vide = image simplement redimensionnée, fond détecté."
-Set-Tip $btnAddL "Ajoute une étape d'aplats : la luminosité est réduite à N paliers et chaque zone devient une couleur unie, sans dégradé ni taches isolées.`n2-3 = très graphique, gros aplats ; 5-8 = transitions plus douces.`nEmpiler plusieurs étapes simplifie progressivement l'image."
-Set-Tip $btnAddE "Ajoute un lissage des bords : chaque pixel prend la couleur majoritaire de son voisinage, sans flou ni mélange de couleurs.
-Supprime les petites pointes et dentelures des aplats ; plus le rayon est grand, plus les formes sont arrondies et simplifiées.
-À placer après une étape d'Aplats (sur une image non aplatie, il ne change presque rien)."
+Set-Tip $lstSteps "Les étapes sont appliquées dans cet ordre. Chaque étape Gomme ou Masque possède son propre pinceau et son propre canal.`nSélectionner une étape affiche son image d'entrée pour peindre avant les traitements suivants."
 Set-Tip $btnDel "Retire l'étape sélectionnée."
 Set-Tip $btnUp "Remonte l'étape sélectionnée (appliquée plus tôt)."
 Set-Tip $btnDown "Descend l'étape sélectionnée (appliquée plus tard)."
-Set-Tip $tbStep "Aplats : nombre de paliers de luminosité (2 à 12).
-Bords : rayon du voisinage en pixels (1 à 6)."
-
 $script:steps = New-Object Collections.ArrayList
-[void]$script:steps.Add(@{ Kind = 'L'; Value = 4.0 })
+foreach ($tool in $script:stepTools.Values) {
+    if ($tool.Default) { [void]$script:steps.Add((& $tool.Create)) }
+}
 $script:loading = $false
 function Get-Steps {
-    ($script:steps | ForEach-Object { '{0}{1}' -f $_.Kind, ([string]$_.Value).Replace(',', '.') }) -join ','
+    $maskIndex = 0
+    ($script:steps | ForEach-Object {
+        if ($_.Editor) { '{0}{1}' -f $_.Kind, $maskIndex; $maskIndex++ }
+        else { '{0}{1}' -f $_.Kind, [int]$_.Value }
+    }) -join ','
 }
 function Get-StepText($st) {
-    if ($st.Kind -eq 'E') { 'Lissage des bords : rayon {0}' -f [int]$st.Value } else { 'Aplats : {0} niveaux' -f [int]$st.Value }
+    if ($st.Editor) { $script:stepTools[$st.Kind].Label }
+    else { $script:stepTools[$st.Kind].Label -f [int]$st.Value }
 }
 function Update-StepList([int]$select) {
     $script:loading = $true
@@ -243,15 +265,57 @@ function Update-StepList([int]$select) {
 function Show-StepEditor {
     $script:loading = $true
     $i = $lstSteps.SelectedIndex
+    if ($maskPic) { $maskPic.Capture = $false }
+    $script:maskEditor = $null
+    $script:maskDrawing = $false; $script:maskPoint = $null; $script:brushPoint = $null
+    $script:activeBrushTool = $null
+    if ($pnlMask) { $pnlMask.Visible = $false }
+    $tbStep.Visible = $true
     if ($i -lt 0) { $tbStep.Enabled = $false; $lblStep.Text = 'Sélectionnez une étape pour régler sa valeur' }
+    elseif ($script:steps[$i].Editor) {
+        $st = $script:steps[$i]
+        $script:maskEditor = $st.Editor
+        $script:activeBrushTool = $st.BrushTool
+        $tbStep.Visible = $false
+        $lblStep.Text = '{0} de cette étape' -f $script:stepTools[$st.Kind].Label
+        if ($pnlMask) {
+            foreach ($name in $script:brushButtonGroups.Keys) {
+                $script:brushButtonGroups[$name].Panel.Visible = ($name -eq $script:activeBrushTool)
+            }
+            foreach ($name in $script:brushActionButtons.Keys) {
+                $script:brushActionButtons[$name].Visible = ($name -eq $script:activeBrushTool)
+            }
+            $tool = $script:brushTools[$script:activeBrushTool]
+            $lblMaskHelp.Text = '{0} : image à cette étape, avant la suite des traitements.' -f $tool.Label
+            $chkOverlay.Text = 'Afficher les couleurs {0}' -f $tool.OverlayLabel
+            $btnResetMask.Text = $tool.ResetText
+            $btnLoadMask.Text = 'Charger un masque {0} PNG...' -f $tool.Label
+            $btnSaveMask.Text = 'Enregistrer le masque {0} PNG...' -f $tool.Label
+            $lblMaskStatus.Text = $tool.Status + "`r`nEffets appliqués à cette étape seulement."
+            Set-Tip $chkOverlay ('Afficher uniquement les marques de {0} de cette étape.' -f $tool.Label)
+            Set-Tip $btnLoadMask ('Importe uniquement le canal de {0} depuis un PNG.' -f $tool.Label)
+            Set-Tip $btnSaveMask ('Exporte uniquement le canal de {0} de cette étape.' -f $tool.Label)
+            $pnlMask.Visible = $true
+        }
+    }
     else {
         $st = $script:steps[$i]
         $tbStep.Enabled = $true
-        if ($st.Kind -eq 'E') { $tbStep.Minimum = 1; $tbStep.Maximum = 6 } else { $tbStep.Minimum = 2; $tbStep.Maximum = 12 }
-        $tbStep.Value = [int]$st.Value; $tbStep.TickFrequency = 1
-        $lblStep.Text = if ($st.Kind -eq 'E') { 'Rayon de lissage : {0}' -f [int]$st.Value } else { 'Nombre de niveaux : {0}' -f [int]$st.Value }
+        $tool = $script:stepTools[$st.Kind]
+        $tbStep.SetRange([int]$tool.Minimum, [int]$tool.Maximum)
+        $tbStep.Value = [int]$st.Value
+        $tbStep.TickFrequency = if ($tool.TickFrequency) { [int]$tool.TickFrequency } else { 1 }
+        $lblStep.Text = $tool.ValueLabel -f [int]$st.Value
+        Set-Tip $tbStep $tool.SliderTip
     }
     $script:loading = $false
+    if ($chkOrig) {
+        $bottom = if ($script:maskEditor) { $pnlMask.Bottom } else { $tbStep.Bottom }
+        $chkOrig.Top = $bottom + 8
+        $btnSavePre.Top = $chkOrig.Bottom + 8
+        $lblPreStatus.Top = $btnSavePre.Bottom + 8
+    }
+    if ($pic) { Update-Picture }
 }
 $lstSteps.Add_SelectedIndexChanged({ if (-not $script:loading) { Show-StepEditor } })
 $tbStep.Add_ValueChanged({
@@ -259,14 +323,17 @@ $tbStep.Add_ValueChanged({
     $i = $lstSteps.SelectedIndex; if ($i -lt 0) { return }
     $st = $script:steps[$i]
     $st.Value = [double]$tbStep.Value
-    $lblStep.Text = if ($st.Kind -eq 'E') { 'Rayon de lissage : {0}' -f [int]$st.Value } else { 'Nombre de niveaux : {0}' -f [int]$st.Value }
+    $lblStep.Text = $script:stepTools[$st.Kind].ValueLabel -f [int]$st.Value
     $script:loading = $true; $lstSteps.Items[$i] = '{0}. {1}' -f ($i + 1), (Get-StepText $st); $script:loading = $false
     Request-Work $script:pre
 })
-$btnAddL.Add_Click({ [void]$script:steps.Add(@{ Kind = 'L'; Value = 4.0 }); Update-StepList ($script:steps.Count - 1); Request-Work $script:pre })
-$btnAddE.Add_Click({ [void]$script:steps.Add(@{ Kind = 'E'; Value = 2.0 }); Update-StepList ($script:steps.Count - 1); Request-Work $script:pre })
 $btnDel.Add_Click({
     $i = $lstSteps.SelectedIndex; if ($i -lt 0) { return }
+    if ($script:steps[$i].Editor) {
+        if ($maskPic) { $maskPic.Capture = $false }
+        $script:maskDrawing = $false; $script:maskPoint = $null
+        $script:steps[$i].Editor.Dispose()
+    }
     $script:steps.RemoveAt($i); Update-StepList ([math]::Min($i, $script:steps.Count - 1)); Request-Work $script:pre
 })
 $btnUp.Add_Click({
@@ -297,17 +364,173 @@ $tabPre.Controls.Add($pic); $pic.BringToFront()
 
 function Update-Picture {
     $src = if ($chkOrig.Checked) { $script:orig } else { $script:preBmp }
+    $i = $lstSteps.SelectedIndex
+    $script:previewBmp = $null
+    $sameOrder = $script:resultSteps -and $script:resultSteps.Length -eq $script:steps.Count
+    if ($sameOrder) {
+        for ($j = 0; $j -lt $script:steps.Count; $j++) {
+            if (-not [object]::ReferenceEquals($script:resultSteps[$j], $script:steps[$j])) { $sameOrder = $false; break }
+        }
+    }
+    if ($script:maskEditor -and $sameOrder -and $script:preResult -and $i -ge 0 -and $i -lt $script:preResult.Previews.Length) {
+        $script:previewBmp = $script:preResult.Previews[$i]
+        if (-not $chkOrig.Checked) { $src = $script:previewBmp }
+    }
     $old = $pic.Image
-    $pic.Image = if ($src) { New-Object Drawing.Bitmap $src } else { $null }
+    if ($src -and $script:maskEditor -and -not $chkOrig.Checked) {
+        $marks = $script:maskEditor.Rasterize($src.Width, $src.Height)
+        try { $pic.Image = ($rasterMaskType -as [type])::Apply($src, $marks, $chkOverlay.Checked) }
+        finally { $marks.Dispose() }
+    } else {
+        $pic.Image = if ($src) { New-Object Drawing.Bitmap $src } else { $null }
+    }
     if ($old) { $old.Dispose() }
 }
 
+# ---------- Éditeurs des étapes Gomme et Masque ----------
+if ($script:brushTools.Count) {
+$maskPanelTop = $lblStep.Bottom + 4
+$pnlMask = New-Object Windows.Forms.Panel
+$pnlMask.SetBounds(0, $maskPanelTop, 285, 470)
+$pnlMask.Visible = $false
+$pnlPre.Controls.Add($pnlMask)
+$pnlMask.BringToFront()
+$script:y = 4
+$lblMaskHelp = Add-Label $pnlMask 'Image à cette étape : peindre par cliquer-glisser, avant la suite des traitements.'
+$lblMaskHelp.Height = 36; $script:y += 18
+Add-AsciiBrushButtons $pnlMask
+[void](Add-Label $pnlMask 'Diamètre du pinceau (pixels de l''image)')
+$numBrush = New-Object Windows.Forms.NumericUpDown
+$numBrush.SetBounds(10, $script:y, 100, 24)
+$numBrush.Minimum = 1; $numBrush.Maximum = 500; $numBrush.Value = 30
+$pnlMask.Controls.Add($numBrush); $script:y += 34
+$chkOverlay = New-Object Windows.Forms.CheckBox
+$chkOverlay.Text = 'Afficher les couleurs'; $chkOverlay.Checked = $true
+$chkOverlay.SetBounds(10, $script:y, 270, 26)
+$pnlMask.Controls.Add($chkOverlay); $script:y += 34
+foreach ($spec in @(
+    @('btnResetMask', 'Réinitialiser'),
+    @('btnLoadMask', 'Charger un masque PNG...'),
+    @('btnSaveMask', 'Enregistrer le masque PNG...')
+)) {
+    $button = New-Object Windows.Forms.Button
+    $button.Text = $spec[1]; $button.SetBounds(10, $script:y, 265, 28)
+    $pnlMask.Controls.Add($button); $script:y += 36
+    Set-Variable -Name $spec[0] -Value $button
+}
+Add-AsciiBrushActions $pnlMask
+$lblMaskStatus = Add-Label $pnlMask ''
+$lblMaskStatus.Height = 50
+$pnlMask.Height = $lblMaskStatus.Bottom + 4
+$chkOrig.Top = $pnlMask.Bottom + 4
+$btnSavePre.Top = $chkOrig.Bottom + 8
+$lblPreStatus.Top = $btnSavePre.Bottom + 8
+$maskPic = $pic
+$maskPic.Cursor = [Windows.Forms.Cursors]::Cross
+$script:maskDrawing = $false
+$script:maskPoint = $null
+$script:brushPoint = $null
+
+function Update-MaskPicture {
+    Update-Picture
+    $maskPic.Invalidate()
+}
+function Get-MaskRectangle {
+    if (-not $script:previewBmp -or -not $script:maskEditor -or $chkOrig.Checked -or $maskPic.ClientSize.Width -le 0 -or $maskPic.ClientSize.Height -le 0) { return $null }
+    $scale = [math]::Min($maskPic.ClientSize.Width / $script:previewBmp.Width, $maskPic.ClientSize.Height / $script:previewBmp.Height)
+    $w = [int]($script:previewBmp.Width * $scale); $h = [int]($script:previewBmp.Height * $scale)
+    New-Object Drawing.Rectangle ([int](($maskPic.ClientSize.Width - $w) / 2)), ([int](($maskPic.ClientSize.Height - $h) / 2)), $w, $h
+}
+function Paint-MaskPoint([Drawing.Point]$point) {
+    $brush = Get-AsciiBrush
+    if (-not $brush) { $script:maskPoint = $null; return }
+    $rect = Get-MaskRectangle
+    if ($null -eq $rect -or -not $rect.Contains($point)) { $script:maskPoint = $null; return }
+    $x = [single](($point.X - $rect.X) / $rect.Width)
+    $y = [single](($point.Y - $rect.Y) / $rect.Height)
+    $previous = if ($null -ne $script:maskPoint) { $script:maskPoint } else { New-Object Drawing.PointF $x, $y }
+    $script:maskEditor.Add($previous.X, $previous.Y, $x, $y, [single]($numBrush.Value / $script:previewBmp.Width), $brush.ToolId)
+    $script:maskPoint = New-Object Drawing.PointF $x, $y
+    Update-MaskPicture
+    Request-Work $script:pre
+}
+$maskPic.Add_MouseDown({
+    if ($_.Button -ne [Windows.Forms.MouseButtons]::Left -or -not (Get-AsciiBrush) -or -not $script:previewBmp -or $chkOrig.Checked) { return }
+    $script:maskDrawing = $true; $script:maskPoint = $null
+    $maskPic.Capture = $true
+    Paint-MaskPoint $_.Location
+})
+$maskPic.Add_MouseMove({
+    $script:brushPoint = $_.Location
+    if ($script:maskDrawing) { Paint-MaskPoint $_.Location }
+    $maskPic.Invalidate()
+})
+$maskPic.Add_MouseUp({
+    if ($_.Button -eq [Windows.Forms.MouseButtons]::Left) {
+        $script:maskDrawing = $false; $script:maskPoint = $null; $maskPic.Capture = $false
+    }
+})
+$maskPic.Add_MouseCaptureChanged({
+    if (-not $maskPic.Capture) { $script:maskDrawing = $false; $script:maskPoint = $null }
+})
+$maskPic.Add_MouseLeave({ $script:brushPoint = $null; $maskPic.Invalidate() })
+$maskPic.Add_Paint({
+    $brush = Get-AsciiBrush
+    if (-not $brush) { return }
+    $rect = Get-MaskRectangle
+    if ($null -eq $rect -or $null -eq $script:brushPoint -or -not $rect.Contains($script:brushPoint)) { return }
+    $diameter = [single]($numBrush.Value * $rect.Width / $script:previewBmp.Width)
+    $outline = New-Object Drawing.Pen ([Drawing.Color]::Black), 3
+    $pen = New-Object Drawing.Pen $brush.Color, 1
+    try {
+        $x = [single]($script:brushPoint.X - $diameter / 2); $y = [single]($script:brushPoint.Y - $diameter / 2)
+        $_.Graphics.DrawEllipse($outline, $x, $y, $diameter, $diameter)
+        $_.Graphics.DrawEllipse($pen, $x, $y, $diameter, $diameter)
+    } finally { $outline.Dispose(); $pen.Dispose() }
+})
+$numBrush.Add_ValueChanged({ $maskPic.Invalidate() })
+$chkOverlay.Add_CheckedChanged({ Update-MaskPicture })
+$btnResetMask.Add_Click({
+    if (-not $script:maskEditor) { return }
+    $script:maskEditor.Reset()
+    Update-MaskPicture
+    Request-Work $script:pre
+})
+$btnLoadMask.Add_Click({
+    if (-not $script:preBmp -or -not $script:maskEditor) { return }
+    $d = New-Object Windows.Forms.OpenFileDialog
+    $d.Filter = ('Masque {0} PNG|*.png' -f $script:brushTools[$script:activeBrushTool].Label)
+    if ($d.ShowDialog() -eq 'OK') {
+        try {
+            $script:maskEditor.Load($d.FileName)
+            Update-MaskPicture
+            Request-Work $script:pre
+        } catch { [void][Windows.Forms.MessageBox]::Show("Masque illisible : $($_.Exception.Message)") }
+    }
+    $d.Dispose()
+})
+$btnSaveMask.Add_Click({
+    if (-not $script:preBmp -or -not $script:maskEditor) { return }
+    $d = New-Object Windows.Forms.SaveFileDialog
+    $d.Filter = ('Masque {0} PNG|*.png' -f $script:brushTools[$script:activeBrushTool].Label)
+    if ($d.ShowDialog() -eq 'OK') {
+        $marks = $script:maskEditor.Rasterize($script:preBmp.Width, $script:preBmp.Height)
+        try { $marks.Save($d.FileName, [Drawing.Imaging.ImageFormat]::Png) }
+        finally { $marks.Dispose() }
+    }
+    $d.Dispose()
+})
+}
+Show-StepEditor
+
 # ---------- Onglet 2 : ASCII ----------
 $script:asc = New-Worker $ascWork {
-    if (-not $script:preBmp) { return $null }
-    @($ascType, (New-Object Drawing.Bitmap $script:preBmp), [int]$numW.Value, [int]$numH.Value,
+    if (-not $script:preResult -or $script:pre.Job -or $script:pre.Timer.Enabled) { return $null }
+    $marks = New-Object Drawing.Bitmap $script:preResult.Mask
+    $image = New-Object Drawing.Bitmap $script:preBmp
+    @($ascType, $image, [int]$numW.Value, [int]$numH.Value,
       [double]($tbDetail.Value / 100), $(if ($script:blurOn) { [double]($tbSmooth.Value / 10) } else { 0.0 }), [double]($tbMin.Value / 2),
-      [bool]$chkInv.Checked, [bool]$chkFill.Checked, [string]$txtChars.Text, [double]($tbStraight.Value / 100))
+      [bool]$chkInv.Checked, [bool]$chkFill.Checked, [string]$txtChars.Text, [double]($tbStraight.Value / 100), $marks)
 } {
     param($res, $secs)
     $script:lines = @($res | ForEach-Object { [string]$_ })
@@ -413,6 +636,14 @@ function Open-Image([string]$p) {
     } catch { [void][Windows.Forms.MessageBox]::Show("Image illisible : $p"); return }
     if ($script:orig) { $script:orig.Dispose() }
     $script:orig = $copy
+    $script:sourceGeneration++
+    foreach ($step in $script:steps) { if ($step.Editor) { $step.Editor.Reset() } }
+    $script:asc.Revision++
+    if ($script:preResult) { $script:preResult.Dispose(); $script:preResult = $null }
+    $script:preBmp = $null; $script:previewBmp = $null
+    $script:lines = @(); $txt.Clear()
+    Update-Picture
+    if ($script:brushTools.Count) { Update-MaskPicture }
     $script:file = $p
     $lblFile.Text = $p
     Invoke-Work $script:pre
@@ -434,7 +665,12 @@ $btnSavePre.Add_Click({
     if (-not $script:preBmp) { return }
     $d = New-Object Windows.Forms.SaveFileDialog
     $d.Filter = 'PNG|*.png'
-    if ($d.ShowDialog() -eq 'OK') { $script:preBmp.Save($d.FileName, [Drawing.Imaging.ImageFormat]::Png) }
+    if ($d.ShowDialog() -eq 'OK') {
+        $script:preBmp.Save($d.FileName, [Drawing.Imaging.ImageFormat]::Png)
+        $maskPath = Join-Path (Split-Path $d.FileName) ([IO.Path]::GetFileNameWithoutExtension($d.FileName) + '_mask.png')
+        $script:preResult.Mask.Save($maskPath, [Drawing.Imaging.ImageFormat]::Png)
+        $lblPreStatus.Text = "Image enregistrée avec son masque : $maskPath"
+    }
 })
 
 # ---------- Boucle de scrutation des workers ----------
@@ -443,7 +679,7 @@ $poll.Interval = 100
 $poll.Add_Tick({
     Complete-Work $script:pre
     Complete-Work $script:asc
-    if ($Screenshot -and -not $script:shotDone -and $script:lines.Count -gt 0 -and -not $script:pre.Job -and -not $script:asc.Job) {
+    if ($Screenshot -and -not $script:shotDone -and $script:lines.Count -gt 0 -and -not $script:pre.Job -and -not $script:asc.Job -and -not $script:pre.Timer.Enabled -and -not $script:asc.Timer.Enabled) {
         $script:shotDone = $true
         $tabs.SelectedIndex = $Tab
         $form.Refresh()
@@ -456,5 +692,25 @@ $poll.Add_Tick({
 $poll.Start()
 
 $form.Add_Shown({ if ($Path) { Open-Image (Resolve-Path $Path).Path } })
-$form.Add_FormClosed({ $poll.Stop() })
+$form.Add_FormClosed({
+    $poll.Stop(); $poll.Dispose()
+    foreach ($worker in @($script:pre, $script:asc)) {
+        $worker.Timer.Stop(); $worker.Timer.Dispose()
+        if ($worker.Job) {
+            $worker.Job.Ps.Stop()
+            # A completed but unpolled result still owns bitmaps.
+            try {
+                $pending = $worker.Job.Ps.EndInvoke($worker.Job.Handle)
+                foreach ($item in $pending) { if ($item -is [IDisposable]) { $item.Dispose() } }
+            } catch { }
+            $worker.Job.Ps.Dispose()
+        }
+    }
+    $script:preCache.Dispose()
+    foreach ($image in @($script:orig, $pic.Image)) {
+        if ($image) { $image.Dispose() }
+    }
+    if ($script:preResult) { $script:preResult.Dispose() }
+    foreach ($step in $script:steps) { if ($step.Editor) { $step.Editor.Dispose() } }
+})
 [void]$form.ShowDialog()

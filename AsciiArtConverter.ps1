@@ -1,5 +1,6 @@
 ﻿# Usage : .\AsciiArtConverter.ps1 -Path photo.png [-Width 100] [-Height 40] [-Detail 0.5] [-Smooth 2] [-MinSize 5] [-Invert] [-Fill] [-Straight 0.9] [-Chars "..."] [-Out resultat.txt]
 # Conseil : passer d'abord l'image dans .\AsciiArtPreProcess.ps1 (aplats de couleur, fond blanc préservé) et donner le résultat à -Path.
+# Compatibilité : AsciiArtMask.ps1 applique toujours un masque combine ; le GUI produit separement Gomme et Masque.
 # Contours via une détection de type Canny (étirement du contraste -> flou -> Sobel -> suppression des
 # non-maxima -> hystérésis -> nettoyage des fragments), puis chaque cellule est associée au caractère ASCII
 # dont la FORME (police Consolas) ressemble le plus au contour local : toute la palette est exploitée
@@ -15,7 +16,8 @@ param(
     [switch]$Fill,                                    # ajoute un léger remplissage ( . : ) dans les zones sombres sans contour
     [ValidateRange(0.5, 1.0)][double]$Straight = 0.9, # cohérence minimale pour tracer un trait droit (- _ | / \) : 1 = jamais (tout en recherche de forme), 0.5 = très souvent
     [string]$Chars = '()[]{}~''",.:;!=+',   # caractères de contour autorisés (pour la palette complète : -Chars (-join ([char[]](33..126))) )
-    [string]$Out
+    [string]$Out,
+    [string]$Mask                                   # PNG de retouches : canal vert = exclusion, apres application de la gomme par AsciiArtMask.ps1
 )
 
 $code = @'
@@ -39,9 +41,20 @@ public static class AsciiEdge
     public static string[] Run(Bitmap src, int width, int rows, double detail, double smooth, double minSize,
                                bool invert, bool fill, string chars, double straightThr)
     {
+        return Run(src, width, rows, detail, smooth, minSize, invert, fill, chars, straightThr, null);
+    }
+
+    public static string[] Run(Bitmap src, int width, int rows, double detail, double smooth, double minSize,
+                               bool invert, bool fill, string chars, double straightThr, Bitmap mask)
+    {
         float[] rgb; int w, h;
         Load(src, ref width, ref rows, out rgb, out w, out h);
         int n = w * h;
+        bool[] excluded = LoadExclusion(mask, w, h);
+        bool[] hiddenCells = new bool[width * rows];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                if (excluded[y * w + x]) hiddenCells[(y / CH) * width + x / CW] = true;
 
         // Fond : blanc pur (celui laissé intact par le prétraitement) -> exclu du calcul de contraste
         bool[] bg = new bool[n]; bool hasBg = false;
@@ -50,7 +63,7 @@ public static class AsciiEdge
 
         float[] lum = new float[n];
         for (int i = 0; i < n; i++) lum[i] = bg[i] ? 255f : 0.299f * rgb[i * 3] + 0.587f * rgb[i * 3 + 1] + 0.114f * rgb[i * 3 + 2];
-        Stretch(lum, bg, hasBg);
+        Stretch(lum, bg, hasBg, excluded);
         if (invert) for (int i = 0; i < n; i++) lum[i] = 255f - lum[i];
         float[] blur = smooth > 0 ? Blur(lum, w, h, smooth, (int)Math.Ceiling(smooth * 3)) : lum;   // 0 = pas de flou
 
@@ -64,9 +77,14 @@ public static class AsciiEdge
                 int i = y*w+x; gx[i] = sx; gy[i] = sy; mag[i] = (float)Math.Sqrt(sx*sx + sy*sy);
             }
 
+        // Later preprocessing may change colors beside an untouched excluded zone.
+        // Reject gradients whose sampling footprint crosses that zone, not just its center.
+        SuppressMaskedGradients(mag, excluded, w, h, 1 + (smooth > 0 ? (int)Math.Ceiling(smooth * 3) : 0));
         float[] nms = NonMaxSuppression(mag, gx, gy, w, h);
         bool[] edge = Hysteresis(nms, w, h, detail, Math.Max(1.0, smooth));
         RemoveSmall(edge, w, h, 14, (int)Math.Round(minSize * CW));
+        // Keep the original image during detection: the mask cannot introduce a cut-out edge.
+        for (int i = 0; i < n; i++) if (excluded[i]) edge[i] = false;
 
         // Carte de contours légèrement floutée : tolère un petit décalage avec la forme des glyphes
         float[] ef = new float[w * h];
@@ -90,6 +108,7 @@ public static class AsciiEdge
             grid[cy] = line;
             for (int cx = 0; cx < width; cx++)
             {
+                if (hiddenCells[cy * width + cx]) continue;
                 int count = 0; double lsum = 0; double en = 0;
                 double c2 = 0, s2 = 0, wsum = 0, sy = 0;
                 Array.Clear(nk, 0, 4); Array.Clear(sxk, 0, 4); Array.Clear(syk, 0, 4);
@@ -182,7 +201,70 @@ public static class AsciiEdge
             }
         }
         string[] lines = new string[rows];
+        // Also clear characters moved into the previous row by straight-line placement.
+        for (int cy = 0; cy < rows; cy++)
+            for (int cx = 0; cx < width; cx++)
+                if (hiddenCells[cy * width + cx]) grid[cy][cx] = ' ';
         for (int cy = 0; cy < rows; cy++) lines[cy] = new string(grid[cy]).TrimEnd();        return lines;
+    }
+
+    static void SuppressMaskedGradients(float[] magnitude, bool[] excluded, int width, int height, int radius)
+    {
+        bool any = false;
+        foreach (bool value in excluded) if (value) { any = true; break; }
+        if (!any) return;
+        bool[] horizontal = new bool[excluded.Length];
+        for (int y = 0; y < height; y++)
+        {
+            int count = 0, row = y * width;
+            for (int x = 0; x <= Math.Min(radius, width - 1); x++) if (excluded[row + x]) count++;
+            for (int x = 0; x < width; x++)
+            {
+                horizontal[row + x] = count > 0;
+                if (x - radius >= 0 && excluded[row + x - radius]) count--;
+                if (x + radius + 1 < width && excluded[row + x + radius + 1]) count++;
+            }
+        }
+        for (int x = 0; x < width; x++)
+        {
+            int count = 0;
+            for (int y = 0; y <= Math.Min(radius, height - 1); y++) if (horizontal[y * width + x]) count++;
+            for (int y = 0; y < height; y++)
+            {
+                if (count > 0) magnitude[y * width + x] = 0;
+                if (y - radius >= 0 && horizontal[(y - radius) * width + x]) count--;
+                if (y + radius + 1 < height && horizontal[(y + radius + 1) * width + x]) count++;
+            }
+        }
+    }
+
+    static bool[] LoadExclusion(Bitmap mask, int width, int height)
+    {
+        bool[] excluded = new bool[width * height];
+        if (mask == null) return excluded;
+        var data = mask.LockBits(new Rectangle(0, 0, mask.Width, mask.Height), System.Drawing.Imaging.ImageLockMode.ReadOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            byte[] row = new byte[mask.Width * 4];
+            for (int y = 0; y < mask.Height; y++)
+            {
+                System.Runtime.InteropServices.Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), row, 0, row.Length);
+                int y0 = (int)((long)y * height / mask.Height);
+                int y1 = (int)(((long)(y + 1) * height + mask.Height - 1) / mask.Height);
+                for (int x = 0; x < mask.Width; x++)
+                {
+                    if (row[x * 4 + 1] < 128) continue;
+                    // Preserve even a one-pixel mark when the ASCII working image is smaller.
+                    int x0 = (int)((long)x * width / mask.Width);
+                    int x1 = (int)(((long)(x + 1) * width + mask.Width - 1) / mask.Width);
+                    for (int yy = y0; yy < y1; yy++)
+                        for (int xx = x0; xx < x1; xx++) excluded[yy * width + xx] = true;
+                }
+            }
+        }
+        finally { mask.UnlockBits(data); }
+        return excluded;
     }
 
     // Rend chaque caractère demandé dans une tuile CW x CH (couverture 0..1), légèrement floutée
@@ -267,10 +349,10 @@ public static class AsciiEdge
 
     // Étire le contraste du sujet (percentiles 1%..99%). Si un fond blanc existe, le sujet est ramené à 0..200
     // pour que sa silhouette garde toujours un contraste net avec le fond.
-    static void Stretch(float[] a, bool[] bg, bool hasBg)
+    static void Stretch(float[] a, bool[] bg, bool hasBg, bool[] excluded)
     {
         List<float> fg = new List<float>();
-        for (int i = 0; i < a.Length; i++) if (!bg[i]) fg.Add(a[i]);
+        for (int i = 0; i < a.Length; i++) if (!bg[i] && !excluded[i]) fg.Add(a[i]);
         if (fg.Count == 0) return;
         float[] s = fg.ToArray(); Array.Sort(s);
         float lo = s[(int)(s.Length * 0.01)], hi = s[(int)((s.Length - 1) * 0.99)];
@@ -389,12 +471,15 @@ if (-not ("$typeName" -as [type])) {
     Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition $code.Replace('AsciiEdge', $typeName)
 }
 
-$lines = ("$typeName" -as [type])::Run((Resolve-Path $Path).Path, $Width, $Height, $Detail, $Smooth, $MinSize, [bool]$Invert, [bool]$Fill, $Chars, $Straight)
+if ($Mask) {
+    $source = New-Object Drawing.Bitmap (Resolve-Path $Path).Path
+    $marks = New-Object Drawing.Bitmap (Resolve-Path $Mask).Path
+    try {
+        $lines = ("$typeName" -as [type])::Run($source, $Width, $Height, $Detail, $Smooth, $MinSize, [bool]$Invert, [bool]$Fill, $Chars, $Straight, $marks)
+    } finally { $source.Dispose(); $marks.Dispose() }
+} else {
+    $lines = ("$typeName" -as [type])::Run((Resolve-Path $Path).Path, $Width, $Height, $Detail, $Smooth, $MinSize, [bool]$Invert, [bool]$Fill, $Chars, $Straight)
+}
 $lines
 if ($Out) { $lines | Set-Content -Path $Out -Encoding UTF8 }
-
-
-
-
-
 
